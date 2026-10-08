@@ -27,6 +27,10 @@ purpose, abstracting most of the complexity from Virtual Machine management.
 Because of the additional isolation, sharing content with processes and other
 containers outside of the krun VM is more difficult.
 
+Compiled seccomp filters are included in the guest OCI configuration through
+**run.oci.seccomp_bpf_data**. An explicitly supplied annotation takes precedence
+over **linux.seccomp**. Guest enforcement depends on support in libkrun's init.
+
 # CONFIGURATION
 
 The microVM can be configured through OCI annotations or a

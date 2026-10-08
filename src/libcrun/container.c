@@ -2847,6 +2847,7 @@ libcrun_container_run_internal (libcrun_container_t *container, libcrun_context_
   pid_t pid;
   int detach = context->detach;
   cleanup_cgroup_status struct libcrun_cgroup_status *cgroup_status = NULL;
+  cleanup_custom_handler_instance struct custom_handler_instance_s *custom_handler = NULL;
   cleanup_close int terminal_fd = -1;
   cleanup_terminal void *orig_terminal = NULL;
   cleanup_close int sync_socket = -1;
@@ -2945,10 +2946,11 @@ libcrun_container_run_internal (libcrun_container_t *container, libcrun_context_
   ret = libcrun_configure_handler (container_args.context->handler_manager,
                                    container_args.context,
                                    container,
-                                   &(container_args.custom_handler),
+                                   &custom_handler,
                                    err);
   if (UNLIKELY (ret < 0))
     return ret;
+  container_args.custom_handler = custom_handler;
 
   if (container_args.custom_handler && container_args.custom_handler->vtable->modify_oci_configuration)
     {

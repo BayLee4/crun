@@ -22,6 +22,8 @@
 #include "../container.h"
 #include "../utils.h"
 #include "../linux.h"
+#include "../seccomp.h"
+#include <linux/filter.h>
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
@@ -98,6 +100,8 @@ struct krun_config
   const char *tap_name;
   int gpu_render_server_fd;
   int gpu_flags;
+  int seccomp_fd;
+  int config_fd;
 };
 
 /* libkrun handler.  */
@@ -826,6 +830,75 @@ spec_has_device (runtime_spec_schema_config_schema *def, const char *path)
   return false;
 }
 
+static int
+libkrun_write_seccomp (struct krun_config *kconf, libcrun_container_t *container, libcrun_error_t *err)
+{
+  static const char alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  cleanup_free char *bpf = NULL;
+  cleanup_free char *encoded = NULL;
+  json_object *doc = NULL, *annotations, *value;
+  const char *config;
+  size_t bpf_size, encoded_size, config_size, i, j;
+  int ret;
+
+  ret = read_all_fd (kconf->seccomp_fd, "seccomp.bpf", &bpf, &bpf_size, err);
+  if (UNLIKELY (ret < 0))
+    return ret;
+  if (UNLIKELY (bpf_size == 0 || bpf_size > BPF_MAXINSNS * sizeof (struct sock_filter)))
+    return crun_make_error (err, EINVAL, "invalid seccomp BPF size");
+
+  encoded_size = 4 * ((bpf_size + 2) / 3);
+  encoded = xmalloc (encoded_size + 1);
+  for (i = 0, j = 0; i < bpf_size; i += 3)
+    {
+      uint32_t word = (uint32_t) (unsigned char) bpf[i] << 16;
+      if (i + 1 < bpf_size)
+        word |= (uint32_t) (unsigned char) bpf[i + 1] << 8;
+      if (i + 2 < bpf_size)
+        word |= (unsigned char) bpf[i + 2];
+      encoded[j++] = alphabet[word >> 18];
+      encoded[j++] = alphabet[(word >> 12) & 63];
+      encoded[j++] = i + 1 < bpf_size ? alphabet[(word >> 6) & 63] : '=';
+      encoded[j++] = i + 2 < bpf_size ? alphabet[word & 63] : '=';
+    }
+  encoded[encoded_size] = '\0';
+
+  config = libcrun_container_get_config_json (container, err);
+  if (UNLIKELY (config == NULL))
+    return -1;
+  ret = parse_json_file (&doc, config, NULL, err);
+  if (UNLIKELY (ret < 0))
+    return ret;
+  annotations = json_object_object_get (doc, "annotations");
+  if (annotations == NULL)
+    {
+      annotations = json_object_new_object ();
+      if (annotations == NULL || json_object_object_add (doc, "annotations", annotations) < 0)
+        OOM ();
+    }
+  value = json_object_new_string_len (encoded, encoded_size);
+  if (value == NULL || json_object_object_add (annotations, "run.oci.seccomp_bpf_data", value) < 0)
+    OOM ();
+  config = json_object_to_json_string_length (doc, JSON_C_TO_STRING_PLAIN, &config_size);
+  if (config == NULL)
+    OOM ();
+  if (UNLIKELY (lseek (kconf->config_fd, 0, SEEK_SET) < 0))
+    {
+      ret = crun_make_error (err, errno, "seek krun configuration file");
+      goto out;
+    }
+  ret = safe_write (kconf->config_fd, KRUN_CONFIG_FILE, config, config_size, err);
+  if (UNLIKELY (ret < 0))
+    goto out;
+  if (UNLIKELY (ftruncate (kconf->config_fd, config_size) < 0))
+    ret = crun_make_error (err, errno, "truncate krun configuration file");
+out:
+  json_object_put (doc);
+  close_and_reset (&kconf->seccomp_fd);
+  close_and_reset (&kconf->config_fd);
+  return ret;
+}
+
 /* libkrun_create_kvm_device: explicitly adds kvm device.  */
 static int
 libkrun_configure_container (void *cookie, enum handler_configure_phase phase,
@@ -882,6 +955,21 @@ libkrun_configure_container (void *cookie, enum handler_configure_phase phase,
       if (UNLIKELY (ret < 0))
         return ret;
 
+#ifdef HAVE_SECCOMP
+      if (def->linux && def->linux->seccomp
+          && find_annotation (container, "run.oci.seccomp_bpf_data") == NULL)
+        {
+          struct libcrun_seccomp_gen_ctx_s gen_ctx;
+
+          libcrun_seccomp_gen_ctx_init (&gen_ctx, container, false, 0);
+          ret = libcrun_open_seccomp_bpf (&gen_ctx, &kconf->seccomp_fd, err);
+          if (UNLIKELY (ret < 0))
+            return ret;
+          kconf->config_fd = fd;
+          fd = -1;
+        }
+#endif
+
       ret = libkrun_read_vm_config (kconf, rootfsfd, rootfs, err);
       if (UNLIKELY (ret < 0))
         return ret;
@@ -893,6 +981,13 @@ libkrun_configure_container (void *cookie, enum handler_configure_phase phase,
 
   if (phase != HANDLER_CONFIGURE_AFTER_MOUNTS)
     return 0;
+
+  if (kconf->seccomp_fd >= 0)
+    {
+      ret = libkrun_write_seccomp (kconf, container, err);
+      if (UNLIKELY (ret < 0))
+        return ret;
+    }
 
   ret = libkrun_configure_network (cookie, container, err);
   if (UNLIKELY (ret < 0))
@@ -965,6 +1060,8 @@ libkrun_load (void **cookie, libcrun_error_t *err)
     return crun_make_error (err, 0, "could not allocate memory for krun_config");
   memset (kconf, 0, sizeof (struct krun_config));
 
+  kconf->seccomp_fd = -1;
+  kconf->config_fd = -1;
   kconf->gpu_render_server_fd = -1;
 
   kconf->handle = dlopen (libkrun_so, RTLD_NOW);
@@ -1030,6 +1127,8 @@ libkrun_unload (void *cookie, libcrun_error_t *err)
   struct krun_config *kconf = (struct krun_config *) cookie;
   if (kconf != NULL)
     {
+      close_and_reset (&kconf->seccomp_fd);
+      close_and_reset (&kconf->config_fd);
       if (kconf->handle != NULL)
         {
           r = dlclose (kconf->handle);
